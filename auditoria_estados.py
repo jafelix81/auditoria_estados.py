@@ -1,22 +1,40 @@
-import io
 import os
+import json
+import math
 import requests
 import pandas as pd
-import numpy as np
+from datetime import datetime, timezone
+
 
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
 
-APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "").strip()
+APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL")
 
 if not APPS_SCRIPT_URL:
     raise RuntimeError(
-        "Falta la variable de entorno APPS_SCRIPT_URL."
+        "No se encontró la variable de entorno APPS_SCRIPT_URL."
     )
 
-# Variables estadísticas que queremos auditar
-VARIABLES = [
+OUTPUT_CSV = "auditoria_estados.csv"
+OUTPUT_JSON = "auditoria_resumen.json"
+OUTPUT_TXT = "auditoria_estados.txt"
+
+
+EXPECTED_COLUMNS = [
+    "RUN_ID",
+    "CAPTURED_AT_UTC",
+    "CAPTURED_AT_LOCAL",
+    "Ticker",
+    "STATUS",
+    "ERROR",
+    "DATA_ATTEMPTS",
+    "DATA_SOURCE",
+    "DATA_OBSERVATIONS",
+    "DATA_FIRST_DATE",
+    "DATA_LAST_DATE",
+    "DATA_DIAGNOSIS",
     "Price_Actual",
     "Price_Close",
     "R1",
@@ -33,27 +51,83 @@ VARIABLES = [
     "Skew20",
     "Kurt20",
     "AC1",
+    "Forward5",
+    "Forward10",
+    "Forward20",
+    "Forward40",
+    "EV5",
+    "EV10",
+    "EV20",
+    "EV40",
+    "Confidence5",
+    "Confidence10",
+    "Confidence20",
+    "Confidence40",
+    "ESS5",
+    "ESS10",
+    "ESS20",
+    "ESS40",
+    "ES95_5",
+    "ES95_10",
+    "ES95_20",
+    "ES95_40",
+    "Kelly25",
 ]
 
-# Estados que consideramos válidos para la auditoría
-STATUS_VALIDOS = {"OK"}
+
+STATE_COLUMNS = [
+    "R1",
+    "R5",
+    "R20",
+    "R60",
+    "R120",
+    "Vol5",
+    "Vol20",
+    "Vol60",
+    "Vol252",
+    "VolRatio20",
+    "VolRatio60",
+    "Skew20",
+    "Kurt20",
+    "AC1",
+]
 
 
 # ============================================================
-# FUNCIONES
+# UTILIDADES
 # ============================================================
+
+def is_finite(value):
+    """Determina si un valor es numéricamente válido."""
+    try:
+        x = float(value)
+        return math.isfinite(x)
+    except (TypeError, ValueError):
+        return False
+
+
+def pct(value):
+    if value is None:
+        return "N/A"
+
+    try:
+        return f"{float(value) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return "N/A"
+
 
 def obtener_datos():
-    """
-    Solicita a Apps Script los datos actuales de CERE_CURRENT.
-
-    El endpoint debe aceptar:
-        {"action": "get_cere_current"}
-    """
+    """Solicita CERE_CURRENT a Apps Script."""
 
     payload = {
         "action": "get_cere_current"
     }
+
+    print("=" * 70)
+    print("AUDITORÍA CERE — LECTURA DE CERE_CURRENT")
+    print("=" * 70)
+
+    print("\nConsultando Google Apps Script...")
 
     response = requests.post(
         APPS_SCRIPT_URL,
@@ -61,460 +135,500 @@ def obtener_datos():
         timeout=60
     )
 
-    response.raise_for_status()
+    print(f"HTTP status: {response.status_code}")
 
-    data = response.json()
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Apps Script respondió HTTP {response.status_code}: "
+            f"{response.text[:1000]}"
+        )
+
+    try:
+        data = response.json()
+    except Exception as e:
+        raise RuntimeError(
+            "La respuesta de Apps Script no es JSON válido.\n"
+            f"Respuesta recibida:\n{response.text[:2000]}"
+        ) from e
 
     if data.get("status") != "success":
         raise RuntimeError(
-            f"Apps Script respondió con error: {data}"
+            "Apps Script reportó un error:\n"
+            + json.dumps(data, ensure_ascii=False, indent=2)
         )
 
+    return data
+
+
+# ============================================================
+# AUDITORÍA
+# ============================================================
+
+def ejecutar_auditoria(data):
+
+    headers = data.get("headers", [])
     rows = data.get("rows", [])
 
-    if not rows:
-        raise RuntimeError(
-            "Apps Script no devolvió filas."
-        )
-
-    return pd.DataFrame(rows)
-
-
-def convertir_numericas(df):
-    """
-    Convierte las variables estadísticas a formato numérico.
-    """
-
-    for col in VARIABLES:
-        if col in df.columns:
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
-            )
-
-    return df
-
-
-def resumen_variable(series):
-    """
-    Calcula estadísticas robustas para una variable.
-    """
-
-    s = pd.to_numeric(series, errors="coerce")
-
-    total = len(s)
-    missing = int(s.isna().sum())
-
-    finite = s[np.isfinite(s)]
-
-    nan_count = int(s.isna().sum())
-
-    if len(finite) == 0:
-        return {
-            "n": total,
-            "validos": 0,
-            "missing": missing,
-            "nan_inf": nan_count,
-            "min": np.nan,
-            "p01": np.nan,
-            "p05": np.nan,
-            "p25": np.nan,
-            "mediana": np.nan,
-            "p75": np.nan,
-            "p95": np.nan,
-            "p99": np.nan,
-            "max": np.nan,
-        }
-
-    return {
-        "n": total,
-        "validos": len(finite),
-        "missing": missing,
-        "nan_inf": nan_count,
-        "min": finite.min(),
-        "p01": finite.quantile(0.01),
-        "p05": finite.quantile(0.05),
-        "p25": finite.quantile(0.25),
-        "mediana": finite.median(),
-        "p75": finite.quantile(0.75),
-        "p95": finite.quantile(0.95),
-        "p99": finite.quantile(0.99),
-        "max": finite.max(),
-    }
-
-
-def detectar_outliers(series):
-    """
-    Detecta outliers mediante regla IQR.
-
-    No significa que sean errores.
-    Solamente los marca para revisión.
-    """
-
-    s = pd.to_numeric(series, errors="coerce")
-    s = s[np.isfinite(s)]
-
-    if len(s) < 10:
-        return 0, np.nan, np.nan
-
-    q1 = s.quantile(0.25)
-    q3 = s.quantile(0.75)
-
-    iqr = q3 - q1
-
-    if iqr == 0:
-        return 0, q1, q3
-
-    lower = q1 - 3.0 * iqr
-    upper = q3 + 3.0 * iqr
-
-    count = int(((s < lower) | (s > upper)).sum())
-
-    return count, lower, upper
-
-
-def revisar_consistencia(df):
-    """
-    Revisa condiciones básicas que sí podemos considerar
-    potencialmente problemáticas.
-    """
-
-    problemas = []
-
-    # Volatilidades no pueden ser negativas
-    for col in [
-        "Vol5",
-        "Vol20",
-        "Vol60",
-        "Vol252",
-    ]:
-        if col in df.columns:
-            s = pd.to_numeric(df[col], errors="coerce")
-            negativos = int((s < 0).sum())
-
-            if negativos:
-                problemas.append(
-                    f"{col}: {negativos} valores negativos"
-                )
-
-    # Ratios de volatilidad deberían ser positivos
-    for col in [
-        "VolRatio20",
-        "VolRatio60",
-    ]:
-        if col in df.columns:
-            s = pd.to_numeric(df[col], errors="coerce")
-            invalidos = int((s <= 0).sum())
-
-            if invalidos:
-                problemas.append(
-                    f"{col}: {invalidos} valores <= 0"
-                )
-
-    # Precios deben ser positivos
-    for col in [
-        "Price_Actual",
-        "Price_Close",
-    ]:
-        if col in df.columns:
-            s = pd.to_numeric(df[col], errors="coerce")
-            invalidos = int((s <= 0).sum())
-
-            if invalidos:
-                problemas.append(
-                    f"{col}: {invalidos} valores <= 0"
-                )
-
-    # Retornos extremadamente grandes.
-    # No se consideran automáticamente errores.
-    # Solo se reportan.
-    for col in [
-        "R1",
-        "R5",
-        "R20",
-        "R60",
-        "R120",
-    ]:
-        if col in df.columns:
-            s = pd.to_numeric(df[col], errors="coerce")
-            extremos = int(
-                (np.abs(s) > 2.0).sum()
-            )
-
-            if extremos:
-                problemas.append(
-                    f"{col}: {extremos} valores con "
-                    f"|retorno| > 200%"
-                )
-
-    return problemas
-
-
-# ============================================================
-# EJECUCIÓN
-# ============================================================
-
-print("=" * 70)
-print("🔬 CERE — AUDITORÍA DE ESTADOS")
-print("=" * 70)
-
-print("\n📥 Obteniendo CERE_CURRENT desde Google Sheets...")
-
-df = obtener_datos()
-
-print(f"Filas recibidas: {len(df)}")
-
-# ------------------------------------------------------------
-# Filtrar solamente OK
-# ------------------------------------------------------------
-
-if "STATUS" not in df.columns:
-    raise RuntimeError(
-        "La columna STATUS no existe en CERE_CURRENT."
-    )
-
-df_ok = df[
-    df["STATUS"].astype(str).str.upper().isin(STATUS_VALIDOS)
-].copy()
-
-print(f"Filas STATUS=OK: {len(df_ok)}")
-
-# ------------------------------------------------------------
-# Verificación de columnas
-# ------------------------------------------------------------
-
-print("\n" + "=" * 70)
-print("📋 VERIFICACIÓN DE VARIABLES")
-print("=" * 70)
-
-faltantes = []
-
-for col in VARIABLES:
-    if col not in df_ok.columns:
-        faltantes.append(col)
-
-if faltantes:
-    print("\n❌ VARIABLES FALTANTES:")
-    for col in faltantes:
-        print(f"  • {col}")
-
-    raise RuntimeError(
-        "Faltan variables necesarias para la auditoría."
-    )
-
-print("✅ Todas las variables requeridas están presentes.")
-
-# ------------------------------------------------------------
-# Conversión numérica
-# ------------------------------------------------------------
-
-df_ok = convertir_numericas(df_ok)
-
-# ------------------------------------------------------------
-# RESUMEN ESTADÍSTICO
-# ------------------------------------------------------------
-
-print("\n" + "=" * 70)
-print("📊 RESUMEN ESTADÍSTICO")
-print("=" * 70)
-
-resultados = []
-
-for col in VARIABLES:
-
-    stats = resumen_variable(df_ok[col])
-
-    outliers, lower, upper = detectar_outliers(
-        df_ok[col]
-    )
-
-    stats["variable"] = col
-    stats["outliers_IQR_3x"] = outliers
-    stats["limite_inferior"] = lower
-    stats["limite_superior"] = upper
-
-    resultados.append(stats)
-
-    print(
-        f"\n{col}"
-    )
-
-    print(
-        f"  N válido      : {stats['validos']}"
-    )
-
-    print(
-        f"  Missing       : {stats['missing']}"
-    )
-
-    print(
-        f"  Min           : {stats['min']:.6g}"
-    )
-
-    print(
-        f"  P01           : {stats['p01']:.6g}"
-    )
-
-    print(
-        f"  P05           : {stats['p05']:.6g}"
-    )
-
-    print(
-        f"  P25           : {stats['p25']:.6g}"
-    )
-
-    print(
-        f"  Mediana       : {stats['mediana']:.6g}"
-    )
-
-    print(
-        f"  P75           : {stats['p75']:.6g}"
-    )
-
-    print(
-        f"  P95           : {stats['p95']:.6g}"
-    )
-
-    print(
-        f"  P99           : {stats['p99']:.6g}"
-    )
-
-    print(
-        f"  Max           : {stats['max']:.6g}"
-    )
-
-    print(
-        f"  Outliers IQR  : {outliers}"
-    )
-
-# ------------------------------------------------------------
-# CONSISTENCIA
-# ------------------------------------------------------------
-
-print("\n" + "=" * 70)
-print("🧪 PRUEBAS DE CONSISTENCIA")
-print("=" * 70)
-
-problemas = revisar_consistencia(df_ok)
-
-if not problemas:
-    print("✅ No se encontraron inconsistencias básicas.")
-else:
-    print(
-        f"⚠️ Se encontraron {len(problemas)} "
-        f"observaciones para revisar:"
-    )
-
-    for p in problemas:
-        print(f"  • {p}")
-
-# ------------------------------------------------------------
-# COMPLETITUD POR VARIABLE
-# ------------------------------------------------------------
-
-print("\n" + "=" * 70)
-print("📈 COMPLETITUD")
-print("=" * 70)
-
-for col in VARIABLES:
-
-    s = pd.to_numeric(
-        df_ok[col],
-        errors="coerce"
-    )
-
-    validos = int(
-        np.isfinite(s).sum()
-    )
-
-    porcentaje = (
-        validos / len(df_ok) * 100
-        if len(df_ok) else 0
-    )
-
-    print(
-        f"{col:15s} "
-        f"{validos:3d}/{len(df_ok):3d} "
-        f"({porcentaje:6.2f}%)"
-    )
-
-# ------------------------------------------------------------
-# TOP EXTREMOS
-# ------------------------------------------------------------
-
-print("\n" + "=" * 70)
-print("🚨 EXTREMOS PARA REVISIÓN")
-print("=" * 70)
-
-for col in [
-    "VolRatio20",
-    "VolRatio60",
-    "Skew20",
-    "Kurt20",
-    "AC1",
-]:
-
-    if col not in df_ok.columns:
-        continue
-
-    temp = df_ok[
-        ["Ticker", col]
-    ].copy()
-
-    temp[col] = pd.to_numeric(
-        temp[col],
-        errors="coerce"
-    )
-
-    temp = temp[
-        np.isfinite(temp[col])
+    print("\n" + "=" * 70)
+    print("1. ESTRUCTURA")
+    print("=" * 70)
+
+    print(f"Columnas recibidas : {len(headers)}")
+    print(f"Filas recibidas    : {len(rows)}")
+
+    # --------------------------------------------------------
+    # COLUMNAS
+    # --------------------------------------------------------
+
+    missing_columns = [
+        col for col in EXPECTED_COLUMNS
+        if col not in headers
     ]
 
-    if temp.empty:
-        continue
+    extra_columns = [
+        col for col in headers
+        if col not in EXPECTED_COLUMNS
+    ]
 
-    temp["abs"] = temp[col].abs()
+    if missing_columns:
+        print("\n❌ COLUMNAS FALTANTES:")
+        for col in missing_columns:
+            print(f"   - {col}")
+    else:
+        print("\n✓ Todas las columnas esperadas están presentes.")
 
-    top = temp.sort_values(
-        "abs",
-        ascending=False
-    ).head(10)
+    if extra_columns:
+        print("\n⚠ COLUMNAS ADICIONALES:")
+        for col in extra_columns:
+            print(f"   - {col}")
+    else:
+        print("✓ No existen columnas adicionales.")
 
-    print(f"\n{col} — 10 valores más extremos:")
+    # --------------------------------------------------------
+    # DATAFRAME
+    # --------------------------------------------------------
 
-    for _, row in top.iterrows():
-        print(
-            f"  {row['Ticker']:8s} "
-            f"{row[col]: .6g}"
+    df = pd.DataFrame(rows, columns=headers)
+
+    # --------------------------------------------------------
+    # TICKERS
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("2. TICKERS")
+    print("=" * 70)
+
+    if "Ticker" not in df.columns:
+        raise RuntimeError("No existe la columna Ticker.")
+
+    tickers = df["Ticker"].astype(str).str.strip()
+
+    print(f"Tickers totales: {len(tickers)}")
+    print(f"Tickers únicos : {tickers.nunique()}")
+
+    duplicates = tickers[tickers.duplicated()].unique().tolist()
+
+    if duplicates:
+        print("\n❌ TICKERS DUPLICADOS:")
+        for ticker in duplicates:
+            print(f"   - {ticker}")
+    else:
+        print("✓ No hay tickers duplicados.")
+
+    blank_tickers = df[
+        df["Ticker"].isna()
+        | (df["Ticker"].astype(str).str.strip() == "")
+    ]
+
+    if len(blank_tickers):
+        print(f"❌ Tickers vacíos: {len(blank_tickers)}")
+    else:
+        print("✓ No hay tickers vacíos.")
+
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("3. STATUS")
+    print("=" * 70)
+
+    status_counts = (
+        df["STATUS"]
+        .fillna("BLANK")
+        .astype(str)
+        .value_counts()
+        .to_dict()
+    )
+
+    for status, count in status_counts.items():
+        print(f"{status:15s}: {count}")
+
+    # --------------------------------------------------------
+    # ESTADOS OK
+    # --------------------------------------------------------
+
+    df_ok = df[
+        df["STATUS"].astype(str).str.upper() == "OK"
+    ].copy()
+
+    print(f"\nRegistros OK: {len(df_ok)}")
+
+    # --------------------------------------------------------
+    # VARIABLES DEL ESTADO
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("4. VARIABLES ESTADÍSTICAS DEL ESTADO")
+    print("=" * 70)
+
+    state_report = {}
+
+    for col in STATE_COLUMNS:
+
+        if col not in df.columns:
+            state_report[col] = {
+                "missing_column": True
+            }
+            print(f"\n❌ {col}: columna inexistente")
+            continue
+
+        numeric = pd.to_numeric(
+            df_ok[col],
+            errors="coerce"
         )
 
-# ------------------------------------------------------------
-# RESULTADO FINAL
-# ------------------------------------------------------------
+        total = len(numeric)
+        valid = numeric.notna().sum()
+        missing = numeric.isna().sum()
 
-print("\n" + "=" * 70)
-print("🏁 RESULTADO DE LA AUDITORÍA")
-print("=" * 70)
+        finite = numeric.apply(is_finite).sum()
 
-print(
-    f"Universo recibido : {len(df)}"
-)
+        unique = numeric.dropna().nunique()
 
-print(
-    f"STATUS=OK         : {len(df_ok)}"
-)
+        if valid > 0:
+            minimum = float(numeric.min())
+            maximum = float(numeric.max())
+            mean = float(numeric.mean())
+            std = float(numeric.std())
+        else:
+            minimum = None
+            maximum = None
+            mean = None
+            std = None
 
-print(
-    f"Variables auditadas: {len(VARIABLES)}"
-)
+        state_report[col] = {
+            "total_ok": int(total),
+            "valid": int(valid),
+            "missing": int(missing),
+            "finite": int(finite),
+            "unique": int(unique),
+            "min": minimum,
+            "max": maximum,
+            "mean": mean,
+            "std": std,
+        }
 
-if not problemas:
-    print(
-        "Estado general    : ✅ SIN INCONSISTENCIAS BÁSICAS"
+        if missing == 0 and finite == total:
+            symbol = "✓"
+        else:
+            symbol = "⚠"
+
+        print(
+            f"{symbol} {col:12s} "
+            f"válidos={valid:3d} "
+            f"faltantes={missing:3d} "
+            f"únicos={unique:3d}"
+        )
+
+    # --------------------------------------------------------
+    # PRECIOS
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("5. PRECIOS")
+    print("=" * 70)
+
+    for col in ["Price_Actual", "Price_Close"]:
+
+        if col not in df_ok.columns:
+            continue
+
+        numeric = pd.to_numeric(
+            df_ok[col],
+            errors="coerce"
+        )
+
+        print(
+            f"{col:15s}: "
+            f"válidos={numeric.notna().sum():3d} / {len(df_ok)}"
+        )
+
+    # --------------------------------------------------------
+    # FECHAS
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("6. FECHAS DE DATOS")
+    print("=" * 70)
+
+    if "DATA_LAST_DATE" in df_ok.columns:
+
+        dates = pd.to_datetime(
+            df_ok["DATA_LAST_DATE"],
+            errors="coerce"
+        )
+
+        valid_dates = dates.dropna()
+
+        if len(valid_dates):
+
+            print(
+                "Fecha más antigua : "
+                f"{valid_dates.min().date()}"
+            )
+
+            print(
+                "Fecha más reciente: "
+                f"{valid_dates.max().date()}"
+            )
+
+            print(
+                "Fechas válidas    : "
+                f"{len(valid_dates)} / {len(df_ok)}"
+            )
+
+    # --------------------------------------------------------
+    # FORWARD / EV
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("7. CAMPOS CERE V2")
+    print("=" * 70)
+
+    v2_columns = [
+        "Forward5",
+        "Forward10",
+        "Forward20",
+        "Forward40",
+        "EV5",
+        "EV10",
+        "EV20",
+        "EV40",
+        "Confidence5",
+        "Confidence10",
+        "Confidence20",
+        "Confidence40",
+        "ESS5",
+        "ESS10",
+        "ESS20",
+        "ESS40",
+        "ES95_5",
+        "ES95_10",
+        "ES95_20",
+        "ES95_40",
+        "Kelly25",
+    ]
+
+    for col in v2_columns:
+
+        if col not in df.columns:
+            print(f"❌ {col}: no existe")
+            continue
+
+        numeric = pd.to_numeric(
+            df_ok[col],
+            errors="coerce"
+        )
+
+        valid = numeric.notna().sum()
+
+        print(
+            f"{col:15s}: "
+            f"{valid:3d}/{len(df_ok)} valores"
+        )
+
+    # --------------------------------------------------------
+    # EXPORTAR CSV
+    # --------------------------------------------------------
+
+    df.to_csv(
+        OUTPUT_CSV,
+        index=False,
+        encoding="utf-8-sig"
     )
-else:
-    print(
-        "Estado general    : ⚠️ REQUIERE REVISIÓN"
-    )
 
-print("=" * 70)
+    # --------------------------------------------------------
+    # RESUMEN
+    # --------------------------------------------------------
+
+    summary = {
+        "audit_timestamp_utc": datetime.now(
+            timezone.utc
+        ).isoformat(),
+
+        "sheet": data.get("sheet"),
+
+        "row_count": len(df),
+
+        "column_count": len(headers),
+
+        "expected_row_count": 339,
+
+        "expected_column_count": 46,
+
+        "row_count_ok": len(df) == 339,
+
+        "column_count_ok": len(headers) == 46,
+
+        "missing_columns": missing_columns,
+
+        "extra_columns": extra_columns,
+
+        "unique_tickers": int(tickers.nunique()),
+
+        "duplicate_tickers": duplicates,
+
+        "status_counts": status_counts,
+
+        "ok_count": len(df_ok),
+
+        "state_report": state_report,
+    }
+
+    with open(
+        OUTPUT_JSON,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            summary,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    # --------------------------------------------------------
+    # REPORTE TXT
+    # --------------------------------------------------------
+
+    with open(
+        OUTPUT_TXT,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        f.write(
+            "AUDITORÍA CERE — CERE_CURRENT\n"
+        )
+
+        f.write("=" * 70 + "\n\n")
+
+        f.write(
+            f"Filas: {len(df)}\n"
+        )
+
+        f.write(
+            f"Columnas: {len(headers)}\n"
+        )
+
+        f.write(
+            f"Tickers únicos: {tickers.nunique()}\n"
+        )
+
+        f.write(
+            f"Registros OK: {len(df_ok)}\n\n"
+        )
+
+        f.write("STATUS\n")
+        f.write("-" * 30 + "\n")
+
+        for status, count in status_counts.items():
+            f.write(
+                f"{status}: {count}\n"
+            )
+
+        f.write("\nVARIABLES DE ESTADO\n")
+        f.write("-" * 30 + "\n")
+
+        for col, info in state_report.items():
+
+            f.write(
+                f"{col}: {json.dumps(info, ensure_ascii=False)}\n"
+            )
+
+    # --------------------------------------------------------
+    # RESULTADO FINAL
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("RESULTADO DE LA AUDITORÍA")
+    print("=" * 70)
+
+    problems = []
+
+    if len(df) != 339:
+        problems.append(
+            f"Se esperaban 339 filas y se recibieron {len(df)}."
+        )
+
+    if len(headers) != 46:
+        problems.append(
+            f"Se esperaban 46 columnas y se recibieron {len(headers)}."
+        )
+
+    if missing_columns:
+        problems.append(
+            f"Faltan {len(missing_columns)} columnas."
+        )
+
+    if duplicates:
+        problems.append(
+            f"Hay {len(duplicates)} tickers duplicados."
+        )
+
+    if problems:
+
+        print("\n⚠ AUDITORÍA CON OBSERVACIONES\n")
+
+        for problem in problems:
+            print(f" - {problem}")
+
+    else:
+
+        print("\n✓ ESTRUCTURA CORRECTA")
+        print("✓ 339 registros recibidos")
+        print("✓ 46 columnas recibidas")
+        print("✓ Sin tickers duplicados")
+        print("✓ Estructura CERE_CURRENT compatible")
+
+    print("\nArchivos generados:")
+    print(f" - {OUTPUT_CSV}")
+    print(f" - {OUTPUT_JSON}")
+    print(f" - {OUTPUT_TXT}")
+
+    return summary
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    try:
+
+        data = obtener_datos()
+
+        ejecutar_auditoria(data)
+
+    except Exception as e:
+
+        print("\n" + "=" * 70)
+        print("❌ ERROR EN AUDITORÍA")
+        print("=" * 70)
+
+        print(str(e))
+
+        raise
