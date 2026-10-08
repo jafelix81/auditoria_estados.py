@@ -154,86 +154,96 @@ def is_finite(value):
 # ============================================================
 
 def obtener_datos():
-
     """
-    Solicita CERE_CURRENT a Google Apps Script.
+    Lee CERE_CURRENT mediante GET al Web App de Google Apps Script.
 
-    IMPORTANTE:
-    Google Apps Script puede responder inicialmente con una
-    redirección HTTP. Por eso NO usamos allow_redirects=True
-    en el primer POST.
-
-    Si existe una redirección, recuperamos explícitamente
-    la URL y volvemos a enviar el POST.
+    El endpoint debe responder a:
+    .../exec?action=get_cere_current
     """
 
-    payload = {
-        "action": "get_cere_current"
-    }
-
     print("=" * 70)
-    print("AUDITORÍA CERE — LECTURA DE CERE_CURRENT")
+    print("Consultando Google Apps Script...")
     print("=" * 70)
 
-    print("\nConsultando Google Apps Script...")
+    url = os.environ.get("APPS_SCRIPT_URL", "").strip()
 
-    # --------------------------------------------------------
-    # PRIMER POST
-    # --------------------------------------------------------
-
-    response = requests.post(
-        APPS_SCRIPT_URL,
-        json=payload,
-        timeout=60,
-        allow_redirects=False
-    )
-
-    print(f"HTTP inicial: {response.status_code}")
-
-    # --------------------------------------------------------
-    # MANEJO DE REDIRECCIÓN
-    # --------------------------------------------------------
-
-    if response.status_code in (301, 302, 303, 307, 308):
-
-        redirect_url = response.headers.get("Location")
-
-        if not redirect_url:
-
-            raise RuntimeError(
-                "Apps Script respondió con una redirección "
-                f"HTTP {response.status_code}, pero no proporcionó "
-                "el header Location."
-            )
-
-        redirect_url = urljoin(
-            APPS_SCRIPT_URL,
-            redirect_url
+    if not url:
+        raise RuntimeError(
+            "No existe la variable de entorno APPS_SCRIPT_URL."
         )
 
-        print("Redirección detectada.")
-        print("Enviando nuevamente el POST al destino...")
+    # Construir URL de lectura mediante GET.
+    separator = "&" if "?" in url else "?"
+    get_url = url + separator + "action=get_cere_current"
 
-        response = requests.post(
-            redirect_url,
-            json=payload,
-            timeout=60,
-            allow_redirects=True
+    try:
+        respuesta = requests.get(
+            get_url,
+            timeout=120,
+            allow_redirects=True,
+            headers={
+                "Accept": "application/json"
+            }
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(
+            f"No fue posible conectar con Apps Script: {e}"
         )
 
-    # --------------------------------------------------------
-    # STATUS HTTP FINAL
-    # --------------------------------------------------------
+    print(f"HTTP inicial/final: {respuesta.status_code}")
+    print(f"URL final: {respuesta.url}")
 
-    print(f"HTTP final: {response.status_code}")
-
-    if response.status_code != 200:
+    if respuesta.status_code != 200:
+        cuerpo = respuesta.text[:5000]
 
         raise RuntimeError(
-            f"Apps Script respondió HTTP {response.status_code}:\n"
-            f"{response.text[:2000]}"
+            f"Apps Script respondió HTTP {respuesta.status_code}:\n"
+            f"{cuerpo}"
         )
 
+    try:
+        data = respuesta.json()
+    except ValueError:
+        raise RuntimeError(
+            "Apps Script respondió HTTP 200, pero la respuesta "
+            "no es JSON válido.\n\n"
+            f"Respuesta recibida:\n{respuesta.text[:5000]}"
+        )
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "La respuesta de Apps Script no tiene el formato JSON esperado."
+        )
+
+    if data.get("status") != "success":
+        raise RuntimeError(
+            "Apps Script reportó un error:\n"
+            + json.dumps(data, ensure_ascii=False, indent=2)
+        )
+
+    headers = data.get("headers", [])
+    rows = data.get("rows", [])
+
+    if not isinstance(headers, list):
+        raise RuntimeError(
+            "La respuesta de Apps Script no contiene una lista válida "
+            "en 'headers'."
+        )
+
+    if not isinstance(rows, list):
+        raise RuntimeError(
+            "La respuesta de Apps Script no contiene una lista válida "
+            "en 'rows'."
+        )
+
+    print(f"Hoja: {data.get('sheet')}")
+    print(f"Filas recibidas: {data.get('row_count')}")
+    print(f"Columnas recibidas: {data.get('column_count')}")
+
+    return {
+        "headers": headers,
+        "rows": rows
+    }
     # --------------------------------------------------------
     # PARSEAR JSON
     # --------------------------------------------------------
