@@ -1,0 +1,38 @@
+name: Auditoria CERE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  auditoria:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas
+
+      - name: Ejecutar auditoría CERE
+        env:
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+        run: |
+          python auditoria_estados.py
+
+      - name: Guardar resultados de auditoría
+        uses: actions/upload-artifact@v4
+        with:
+          name: auditoria-cere
+          path: |
+            auditoria_estados.csv
+            auditoria_resumen.json
+            auditoria_estados.txt
