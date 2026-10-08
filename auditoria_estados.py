@@ -1,30 +1,14 @@
 import os
 import json
+import csv
 import math
+from datetime import datetime
+
 import requests
-import pandas as pd
-from datetime import datetime, timezone
-from urllib.parse import urljoin
 
 
 # ============================================================
 # CONFIGURACIÓN
-# ============================================================
-
-APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL")
-
-if not APPS_SCRIPT_URL:
-    raise RuntimeError(
-        "No se encontró la variable de entorno APPS_SCRIPT_URL."
-    )
-
-OUTPUT_CSV = "auditoria_estados.csv"
-OUTPUT_JSON = "auditoria_resumen.json"
-OUTPUT_TXT = "auditoria_estados.txt"
-
-
-# ============================================================
-# ESTRUCTURA ESPERADA DE CERE_CURRENT
 # ============================================================
 
 EXPECTED_COLUMNS = [
@@ -79,12 +63,10 @@ EXPECTED_COLUMNS = [
     "Kelly25",
 ]
 
+EXPECTED_COLUMN_COUNT = len(EXPECTED_COLUMNS)
 
-# ============================================================
-# VARIABLES DEL ESTADO ACTUAL
-# ============================================================
-
-STATE_COLUMNS = [
+# Variables que describen el estado estadístico actual.
+STATE_FEATURES = [
     "R1",
     "R5",
     "R20",
@@ -101,12 +83,9 @@ STATE_COLUMNS = [
     "AC1",
 ]
 
-
-# ============================================================
-# CAMPOS RESERVADOS PARA CERE V2
-# ============================================================
-
-CERE_V2_COLUMNS = [
+# Campos que deliberadamente todavía NO deben contener datos.
+# Se llenarán cuando construyamos el histórico CERE.
+CERE_PLACEHOLDER_FIELDS = [
     "Forward5",
     "Forward10",
     "Forward20",
@@ -130,40 +109,148 @@ CERE_V2_COLUMNS = [
     "Kelly25",
 ]
 
+PRICE_FIELDS = [
+    "Price_Actual",
+    "Price_Close",
+]
+
+DATE_FIELDS = [
+    "DATA_FIRST_DATE",
+    "DATA_LAST_DATE",
+]
+
+NUMERIC_METADATA_FIELDS = [
+    "DATA_ATTEMPTS",
+    "DATA_OBSERVATIONS",
+]
+
+EXPECTED_ACTIVE_STATUSES = {
+    "OK",
+}
+
+KNOWN_STATUSES = {
+    "OK",
+    "DELISTED",
+    "INACTIVE",
+    "INSUFFICIENT",
+    "ERROR",
+}
+
+OUTPUT_CSV = "auditoria_estados.csv"
+OUTPUT_JSON = "auditoria_resumen.json"
+OUTPUT_TXT = "auditoria_estados.txt"
+
 
 # ============================================================
 # UTILIDADES
 # ============================================================
 
-def is_finite(value):
+def print_separator():
+    print("=" * 70)
+
+
+def is_blank(value):
+    if value is None:
+        return True
+
+    if isinstance(value, str):
+        return value.strip() == ""
+
+    return False
+
+
+def to_float(value):
     """
-    Determina si un valor puede convertirse a número
-    y es finito.
+    Convierte un valor a float.
+    Devuelve None si está vacío o no es numérico.
     """
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+
+        if math.isfinite(number):
+            return number
+
+        return None
+
+    text = str(value).strip()
+
+    if text == "":
+        return None
 
     try:
-        x = float(value)
-        return math.isfinite(x)
+        number = float(text)
+
+        if math.isfinite(number):
+            return number
 
     except (TypeError, ValueError):
-        return False
+        pass
+
+    return None
+
+
+def parse_date(value):
+    """
+    Intenta interpretar una fecha proveniente de Google Sheets.
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    formats = [
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+
+    return None
 
 
 # ============================================================
-# OBTENER CERE_CURRENT DESDE APPS SCRIPT
+# LECTURA DE GOOGLE APPS SCRIPT
 # ============================================================
 
 def obtener_datos():
     """
-    Lee CERE_CURRENT mediante GET al Web App de Google Apps Script.
+    Lee CERE_CURRENT mediante GET.
 
-    El endpoint debe responder a:
-    .../exec?action=get_cere_current
+    El endpoint utilizado es:
+
+        .../exec?action=get_cere_current
+
+    Importante:
+    No utilizamos POST para esta operación.
+
+    Apps Script puede devolver un HTTP 302 antes de entregar
+    el JSON final. requests.get(... allow_redirects=True)
+    sigue automáticamente esa redirección.
     """
 
-    print("=" * 70)
+    print_separator()
     print("Consultando Google Apps Script...")
-    print("=" * 70)
+    print_separator()
 
     url = os.environ.get("APPS_SCRIPT_URL", "").strip()
 
@@ -172,9 +259,13 @@ def obtener_datos():
             "No existe la variable de entorno APPS_SCRIPT_URL."
         )
 
-    # Construir URL de lectura mediante GET.
     separator = "&" if "?" in url else "?"
-    get_url = url + separator + "action=get_cere_current"
+
+    get_url = (
+        url
+        + separator
+        + "action=get_cere_current"
+    )
 
     try:
         respuesta = requests.get(
@@ -182,57 +273,73 @@ def obtener_datos():
             timeout=120,
             allow_redirects=True,
             headers={
-                "Accept": "application/json"
-            }
+                "Accept": "application/json",
+                "User-Agent": "CERE-Auditoria/1.0",
+            },
         )
-    except requests.RequestException as e:
+
+    except requests.RequestException as error:
         raise RuntimeError(
-            f"No fue posible conectar con Apps Script: {e}"
+            "No fue posible conectar con Google Apps Script:\n"
+            + str(error)
         )
 
     print(f"HTTP inicial/final: {respuesta.status_code}")
     print(f"URL final: {respuesta.url}")
 
     if respuesta.status_code != 200:
+
         cuerpo = respuesta.text[:5000]
 
         raise RuntimeError(
-            f"Apps Script respondió HTTP {respuesta.status_code}:\n"
-            f"{cuerpo}"
+            f"Apps Script respondió HTTP "
+            f"{respuesta.status_code}:\n{cuerpo}"
         )
 
     try:
         data = respuesta.json()
+
     except ValueError:
+
         raise RuntimeError(
-            "Apps Script respondió HTTP 200, pero la respuesta "
-            "no es JSON válido.\n\n"
-            f"Respuesta recibida:\n{respuesta.text[:5000]}"
+            "Apps Script respondió HTTP 200, "
+            "pero la respuesta no es JSON válido.\n\n"
+            "Respuesta recibida:\n"
+            + respuesta.text[:5000]
         )
 
     if not isinstance(data, dict):
+
         raise RuntimeError(
-            "La respuesta de Apps Script no tiene el formato JSON esperado."
+            "La respuesta de Apps Script no tiene "
+            "el formato JSON esperado."
         )
 
     if data.get("status") != "success":
+
         raise RuntimeError(
             "Apps Script reportó un error:\n"
-            + json.dumps(data, ensure_ascii=False, indent=2)
+            + json.dumps(
+                data,
+                ensure_ascii=False,
+                indent=2,
+            )
         )
 
     headers = data.get("headers", [])
     rows = data.get("rows", [])
 
     if not isinstance(headers, list):
+
         raise RuntimeError(
-            "La respuesta de Apps Script no contiene una lista válida "
+            "La respuesta no contiene una lista válida "
             "en 'headers'."
         )
 
     if not isinstance(rows, list):
+
         raise RuntimeError(
-            "La respuesta de Apps Script no contiene una lista válida "
+            "La respuesta no contiene una lista válida "
             "en 'rows'."
         )
 
@@ -242,685 +349,1035 @@ def obtener_datos():
 
     return {
         "headers": headers,
-        "rows": rows
+        "rows": rows,
+        "sheet": data.get("sheet"),
+        "row_count": data.get("row_count"),
+        "column_count": data.get("column_count"),
     }
-    # --------------------------------------------------------
-    # PARSEAR JSON
-    # --------------------------------------------------------
 
-    try:
 
-        data = response.json()
+# ============================================================
+# CONVERSIÓN DE FILAS
+# ============================================================
 
-    except Exception as e:
+def convertir_filas(headers, rows):
 
-        raise RuntimeError(
-            "La respuesta de Apps Script no es JSON válido.\n"
-            f"Respuesta recibida:\n{response.text[:2000]}"
-        ) from e
+    registros = []
 
-    # --------------------------------------------------------
-    # VALIDAR RESPUESTA DEL SCRIPT
-    # --------------------------------------------------------
+    for index, row in enumerate(rows, start=2):
 
-    if data.get("status") != "success":
+        if not isinstance(row, list):
 
-        raise RuntimeError(
-            "Apps Script reportó un error:\n"
-            + json.dumps(
-                data,
-                ensure_ascii=False,
-                indent=2
+            raise RuntimeError(
+                f"La fila {index} no tiene formato de lista."
             )
+
+        if len(row) != len(headers):
+
+            raise RuntimeError(
+                f"La fila {index} tiene {len(row)} valores, "
+                f"pero existen {len(headers)} columnas."
+            )
+
+        registro = dict(
+            zip(headers, row)
         )
 
-    return data
+        registro["_ROW_NUMBER"] = index
+
+        registros.append(registro)
+
+    return registros
 
 
 # ============================================================
-# AUDITORÍA
+# AUDITORÍA DE ESTRUCTURA
 # ============================================================
 
-def ejecutar_auditoria(data):
+def auditar_estructura(headers, resumen, problemas):
 
-    headers = data.get("headers", [])
-    rows = data.get("rows", [])
-
-    # ========================================================
-    # 1. ESTRUCTURA
-    # ========================================================
-
-    print("\n" + "=" * 70)
+    print_separator()
     print("1. ESTRUCTURA")
-    print("=" * 70)
+    print_separator()
 
-    print(f"Columnas recibidas : {len(headers)}")
-    print(f"Filas recibidas    : {len(rows)}")
+    cantidad = len(headers)
 
-    missing_columns = [
+    print(f"Columnas recibidas : {cantidad}")
+
+    if cantidad == EXPECTED_COLUMN_COUNT:
+        print(
+            f"Columnas esperadas: {EXPECTED_COLUMN_COUNT}"
+        )
+    else:
+        print(
+            f"Columnas esperadas: {EXPECTED_COLUMN_COUNT}"
+        )
+
+        problemas.append(
+            "La estructura no tiene la cantidad esperada "
+            f"de columnas: esperadas={EXPECTED_COLUMN_COUNT}, "
+            f"recibidas={cantidad}."
+        )
+
+    faltantes = [
         col
         for col in EXPECTED_COLUMNS
         if col not in headers
     ]
 
-    extra_columns = [
+    adicionales = [
         col
         for col in headers
         if col not in EXPECTED_COLUMNS
     ]
 
-    if missing_columns:
+    resumen["columnas_faltantes"] = faltantes
+    resumen["columnas_adicionales"] = adicionales
 
-        print("\n❌ COLUMNAS FALTANTES:")
+    if faltantes:
 
-        for col in missing_columns:
+        print("❌ Columnas faltantes:")
+
+        for col in faltantes:
             print(f"   - {col}")
+
+        problemas.append(
+            "Existen columnas esperadas que no están presentes: "
+            + ", ".join(faltantes)
+        )
 
     else:
 
-        print(
-            "\n✓ Todas las columnas esperadas "
-            "están presentes."
-        )
+        print("✓ Todas las columnas esperadas están presentes.")
 
-    if extra_columns:
+    if adicionales:
 
-        print("\n⚠ COLUMNAS ADICIONALES:")
+        print("⚠ Columnas adicionales:")
 
-        for col in extra_columns:
+        for col in adicionales:
             print(f"   - {col}")
+
+        problemas.append(
+            "Existen columnas adicionales: "
+            + ", ".join(adicionales)
+        )
 
     else:
 
         print("✓ No existen columnas adicionales.")
 
-    # ========================================================
-    # CREAR DATAFRAME
-    # ========================================================
+    resumen["columnas_recibidas"] = cantidad
+    resumen["columnas_esperadas"] = EXPECTED_COLUMN_COUNT
 
-    df = pd.DataFrame(
-        rows,
-        columns=headers
-    )
 
-    # ========================================================
-    # 2. TICKERS
-    # ========================================================
+# ============================================================
+# AUDITORÍA DE TICKERS
+# ============================================================
 
-    print("\n" + "=" * 70)
+def auditar_tickers(registros, resumen, problemas):
+
+    print_separator()
     print("2. TICKERS")
-    print("=" * 70)
+    print_separator()
 
-    if "Ticker" not in df.columns:
+    tickers = [
+        str(r.get("Ticker", "")).strip()
+        for r in registros
+    ]
 
-        raise RuntimeError(
-            "No existe la columna Ticker."
-        )
+    vacios = [
+        i + 2
+        for i, ticker in enumerate(tickers)
+        if not ticker
+    ]
 
-    tickers = (
-        df["Ticker"]
-        .astype(str)
-        .str.strip()
+    tickers_no_vacios = [
+        ticker
+        for ticker in tickers
+        if ticker
+    ]
+
+    unicos = set(tickers_no_vacios)
+
+    duplicados = sorted(
+        {
+            ticker
+            for ticker in tickers_no_vacios
+            if tickers_no_vacios.count(ticker) > 1
+        }
     )
 
-    print(
-        f"Tickers totales: {len(tickers)}"
-    )
+    print(f"Tickers totales: {len(tickers)}")
+    print(f"Tickers únicos : {len(unicos)}")
 
-    print(
-        f"Tickers únicos : {tickers.nunique()}"
-    )
+    if duplicados:
 
-    duplicates = (
-        tickers[
-            tickers.duplicated()
-        ]
-        .unique()
-        .tolist()
-    )
+        print("❌ Tickers duplicados:")
 
-    if duplicates:
-
-        print("\n❌ TICKERS DUPLICADOS:")
-
-        for ticker in duplicates:
+        for ticker in duplicados:
             print(f"   - {ticker}")
+
+        problemas.append(
+            "Existen tickers duplicados: "
+            + ", ".join(duplicados)
+        )
 
     else:
 
         print("✓ No hay tickers duplicados.")
 
-    blank_tickers = df[
-        df["Ticker"].isna()
-        |
-        (
-            df["Ticker"]
-            .astype(str)
-            .str.strip()
-            == ""
-        )
-    ]
-
-    if len(blank_tickers):
+    if vacios:
 
         print(
-            f"❌ Tickers vacíos: "
-            f"{len(blank_tickers)}"
+            f"❌ Hay {len(vacios)} filas con ticker vacío."
+        )
+
+        problemas.append(
+            f"Existen {len(vacios)} filas con ticker vacío."
         )
 
     else:
 
         print("✓ No hay tickers vacíos.")
 
-    # ========================================================
-    # 3. STATUS
-    # ========================================================
+    resumen["tickers_totales"] = len(tickers)
+    resumen["tickers_unicos"] = len(unicos)
+    resumen["tickers_duplicados"] = duplicados
+    resumen["tickers_vacios"] = len(vacios)
 
-    print("\n" + "=" * 70)
+
+# ============================================================
+# AUDITORÍA DE STATUS
+# ============================================================
+
+def auditar_status(registros, resumen, problemas):
+
+    print_separator()
     print("3. STATUS")
-    print("=" * 70)
+    print_separator()
 
-    status_counts = (
-        df["STATUS"]
-        .fillna("BLANK")
-        .astype(str)
-        .value_counts()
-        .to_dict()
-    )
+    conteo = {}
 
-    for status, count in status_counts.items():
+    for registro in registros:
 
-        print(
-            f"{status:15s}: {count}"
-        )
+        status = str(
+            registro.get("STATUS", "")
+        ).strip().upper()
 
-    # ========================================================
-    # REGISTROS OK
-    # ========================================================
+        if not status:
+            status = "VACIO"
 
-    df_ok = df[
-        df["STATUS"]
-        .astype(str)
-        .str.upper()
-        == "OK"
-    ].copy()
+        conteo[status] = conteo.get(status, 0) + 1
 
-    print(
-        f"\nRegistros OK: {len(df_ok)}"
-    )
+    orden_preferido = [
+        "OK",
+        "DELISTED",
+        "INACTIVE",
+        "INSUFFICIENT",
+        "ERROR",
+        "VACIO",
+    ]
 
-    # ========================================================
-    # 4. VARIABLES ESTADÍSTICAS DEL ESTADO
-    # ========================================================
+    for status in orden_preferido:
 
-    print("\n" + "=" * 70)
-    print("4. VARIABLES ESTADÍSTICAS DEL ESTADO")
-    print("=" * 70)
-
-    state_report = {}
-
-    for col in STATE_COLUMNS:
-
-        if col not in df.columns:
-
-            state_report[col] = {
-                "missing_column": True
-            }
+        if status in conteo:
 
             print(
-                f"\n❌ {col}: "
-                "columna inexistente"
+                f"{status:<15}: "
+                f"{conteo[status]}"
             )
 
-            continue
+    otros = sorted(
+        set(conteo)
+        - set(orden_preferido)
+    )
 
-        numeric = pd.to_numeric(
-            df_ok[col],
-            errors="coerce"
+    for status in otros:
+
+        print(
+            f"{status:<15}: "
+            f"{conteo[status]}"
         )
 
-        total = len(numeric)
+    estados_desconocidos = [
+        status
+        for status in conteo
+        if status not in KNOWN_STATUSES
+    ]
 
-        valid = int(
-            numeric.notna().sum()
-        )
+    if estados_desconocidos:
 
-        missing = int(
-            numeric.isna().sum()
-        )
-
-        finite = int(
-            numeric.apply(is_finite).sum()
-        )
-
-        unique = int(
-            numeric.dropna().nunique()
-        )
-
-        if valid > 0:
-
-            minimum = float(
-                numeric.min()
+        problemas.append(
+            "Existen STATUS desconocidos: "
+            + ", ".join(
+                sorted(estados_desconocidos)
             )
+        )
 
-            maximum = float(
-                numeric.max()
+    if conteo.get("OK", 0) > 0:
+
+        print(
+            f"Registros OK: "
+            f"{conteo.get('OK', 0)}"
+        )
+
+    resumen["status_counts"] = conteo
+
+
+# ============================================================
+# AUDITORÍA DE VARIABLES ESTADÍSTICAS
+# ============================================================
+
+def auditar_variables_estado(
+    registros,
+    resumen,
+    problemas
+):
+
+    print_separator()
+    print("4. VARIABLES ESTADÍSTICAS DEL ESTADO")
+    print_separator()
+
+    registros_ok = [
+        r
+        for r in registros
+        if str(
+            r.get("STATUS", "")
+        ).strip().upper() == "OK"
+    ]
+
+    resumen["registros_ok"] = len(registros_ok)
+
+    validacion = {}
+
+    for campo in STATE_FEATURES:
+
+        validos = 0
+        faltantes = 0
+        invalidos = 0
+        valores = []
+
+        for registro in registros_ok:
+
+            valor = registro.get(campo)
+
+            if is_blank(valor):
+
+                faltantes += 1
+                continue
+
+            numero = to_float(valor)
+
+            if numero is None:
+
+                invalidos += 1
+                continue
+
+            validos += 1
+            valores.append(numero)
+
+        unicos = len(
+            set(
+                round(v, 12)
+                for v in valores
             )
+        )
 
-            mean = float(
-                numeric.mean()
-            )
-
-            std = float(
-                numeric.std()
-            )
-
-        else:
-
-            minimum = None
-            maximum = None
-            mean = None
-            std = None
-
-        state_report[col] = {
-
-            "total_ok": total,
-
-            "valid": valid,
-
-            "missing": missing,
-
-            "finite": finite,
-
-            "unique": unique,
-
-            "min": minimum,
-
-            "max": maximum,
-
-            "mean": mean,
-
-            "std": std,
+        validacion[campo] = {
+            "validos": validos,
+            "faltantes": faltantes,
+            "invalidos": invalidos,
+            "unicos": unicos,
         }
 
-        if (
-            missing == 0
-            and finite == total
-        ):
-
-            symbol = "✓"
-
-        else:
-
-            symbol = "⚠"
-
         print(
-            f"{symbol} {col:12s} "
-            f"válidos={valid:3d} "
-            f"faltantes={missing:3d} "
-            f"únicos={unique:3d}"
+            f"✓ {campo:<12} "
+            f"válidos={validos:3d} "
+            f"faltantes={faltantes:3d} "
+            f"invalidos={invalidos:3d} "
+            f"únicos={unicos:3d}"
         )
 
-    # ========================================================
-    # 5. PRECIOS
-    # ========================================================
+        if faltantes > 0:
 
-    print("\n" + "=" * 70)
+            problemas.append(
+                f"{campo}: existen {faltantes} "
+                "valores faltantes entre registros OK."
+            )
+
+        if invalidos > 0:
+
+            problemas.append(
+                f"{campo}: existen {invalidos} "
+                "valores no numéricos entre registros OK."
+            )
+
+    resumen["state_features"] = validacion
+
+
+# ============================================================
+# AUDITORÍA DE PRECIOS
+# ============================================================
+
+def auditar_precios(
+    registros,
+    resumen,
+    problemas
+):
+
+    print_separator()
     print("5. PRECIOS")
-    print("=" * 70)
+    print_separator()
 
-    for col in [
-        "Price_Actual",
-        "Price_Close"
-    ]:
+    registros_ok = [
+        r
+        for r in registros
+        if str(
+            r.get("STATUS", "")
+        ).strip().upper() == "OK"
+    ]
 
-        if col not in df_ok.columns:
-            continue
+    validacion = {}
 
-        numeric = pd.to_numeric(
-            df_ok[col],
-            errors="coerce"
-        )
+    for campo in PRICE_FIELDS:
 
-        print(
-            f"{col:15s}: "
-            f"válidos="
-            f"{numeric.notna().sum():3d} "
-            f"/ {len(df_ok)}"
-        )
+        validos = 0
+        faltantes = 0
+        invalidos = 0
+        no_positivos = 0
 
-    # ========================================================
-    # 6. FECHAS
-    # ========================================================
+        for registro in registros_ok:
 
-    print("\n" + "=" * 70)
-    print("6. FECHAS DE DATOS")
-    print("=" * 70)
+            valor = registro.get(campo)
 
-    if "DATA_LAST_DATE" in df_ok.columns:
+            if is_blank(valor):
 
-        dates = pd.to_datetime(
-            df_ok["DATA_LAST_DATE"],
-            errors="coerce"
-        )
+                faltantes += 1
+                continue
 
-        valid_dates = dates.dropna()
+            numero = to_float(valor)
 
-        if len(valid_dates):
+            if numero is None:
 
-            print(
-                "Fecha más antigua : "
-                f"{valid_dates.min().date()}"
-            )
+                invalidos += 1
+                continue
 
-            print(
-                "Fecha más reciente: "
-                f"{valid_dates.max().date()}"
-            )
+            if numero <= 0:
 
-            print(
-                "Fechas válidas    : "
-                f"{len(valid_dates)} "
-                f"/ {len(df_ok)}"
-            )
+                no_positivos += 1
+                continue
 
-        else:
+            validos += 1
 
-            print(
-                "⚠ No se encontraron "
-                "fechas válidas."
-            )
-
-    # ========================================================
-    # 7. CAMPOS RESERVADOS PARA CERE V2
-    # ========================================================
-
-    print("\n" + "=" * 70)
-    print("7. CAMPOS CERE V2")
-    print("=" * 70)
-
-    print(
-        "\nEstos campos todavía deben permanecer "
-        "vacíos en CERE v1.1."
-    )
-
-    for col in CERE_V2_COLUMNS:
-
-        if col not in df.columns:
-
-            print(
-                f"❌ {col}: no existe"
-            )
-
-            continue
-
-        numeric = pd.to_numeric(
-            df_ok[col],
-            errors="coerce"
-        )
-
-        valid = int(
-            numeric.notna().sum()
-        )
+        validacion[campo] = {
+            "validos": validos,
+            "faltantes": faltantes,
+            "invalidos": invalidos,
+            "no_positivos": no_positivos,
+        }
 
         print(
-            f"{col:15s}: "
-            f"{valid:3d}/{len(df_ok)} valores"
+            f"{campo:<15}: "
+            f"válidos={validos:3d} "
+            f"faltantes={faltantes:3d} "
+            f"invalidos={invalidos:3d} "
+            f"<=0={no_positivos:3d}"
         )
 
-    # ========================================================
-    # 8. EXPORTAR CSV
-    # ========================================================
+        if faltantes > 0:
 
-    df.to_csv(
-        OUTPUT_CSV,
-        index=False,
-        encoding="utf-8-sig"
-    )
+            problemas.append(
+                f"{campo}: hay {faltantes} "
+                "valores faltantes."
+            )
 
-    # ========================================================
-    # 9. RESUMEN JSON
-    # ========================================================
+        if invalidos > 0:
 
-    summary = {
+            problemas.append(
+                f"{campo}: hay {invalidos} "
+                "valores no numéricos."
+            )
 
-        "audit_timestamp_utc":
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
+        if no_positivos > 0:
 
-        "sheet":
-            data.get("sheet"),
+            problemas.append(
+                f"{campo}: hay {no_positivos} "
+                "precios menores o iguales a cero."
+            )
 
-        "row_count":
-            len(df),
+    resumen["prices"] = validacion
 
-        "column_count":
-            len(headers),
 
-        "expected_row_count":
-            339,
+# ============================================================
+# AUDITORÍA DE FECHAS Y DATOS DE YAHOO
+# ============================================================
 
-        "expected_column_count":
-            50,
+def auditar_datos_fuente(
+    registros,
+    resumen,
+    problemas
+):
 
-        "row_count_ok":
-            len(df) == 339,
+    print_separator()
+    print("6. INTEGRIDAD DE DATOS DE FUENTE")
+    print_separator()
 
-        "column_count_ok":
-            len(headers) == 50,
+    registros_ok = [
+        r
+        for r in registros
+        if str(
+            r.get("STATUS", "")
+        ).strip().upper() == "OK"
+    ]
 
-        "missing_columns":
-            missing_columns,
-
-        "extra_columns":
-            extra_columns,
-
-        "unique_tickers":
-            int(
-                tickers.nunique()
-            ),
-
-        "duplicate_tickers":
-            duplicates,
-
-        "status_counts":
-            status_counts,
-
-        "ok_count":
-            len(df_ok),
-
-        "state_report":
-            state_report,
+    resumen_fuente = {
+        "first_date_valid": 0,
+        "last_date_valid": 0,
+        "attempts_valid": 0,
+        "observations_valid": 0,
     }
 
-    with open(
-        OUTPUT_JSON,
-        "w",
-        encoding="utf-8"
-    ) as f:
+    for registro in registros_ok:
 
-        json.dump(
-            summary,
-            f,
-            ensure_ascii=False,
-            indent=2
+        ticker = str(
+            registro.get("Ticker", "")
+        ).strip()
+
+        for campo in DATE_FIELDS:
+
+            valor = registro.get(campo)
+
+            if is_blank(valor):
+
+                problemas.append(
+                    f"{ticker}: {campo} está vacío."
+                )
+
+                continue
+
+            fecha = parse_date(valor)
+
+            if fecha is None:
+
+                problemas.append(
+                    f"{ticker}: {campo} no tiene "
+                    "una fecha válida."
+                )
+
+            else:
+
+                if campo == "DATA_FIRST_DATE":
+                    resumen_fuente["first_date_valid"] += 1
+
+                elif campo == "DATA_LAST_DATE":
+                    resumen_fuente["last_date_valid"] += 1
+
+        for campo in NUMERIC_METADATA_FIELDS:
+
+            valor = registro.get(campo)
+
+            numero = to_float(valor)
+
+            if numero is None:
+
+                problemas.append(
+                    f"{ticker}: {campo} no es numérico."
+                )
+
+                continue
+
+            if campo == "DATA_ATTEMPTS":
+
+                if numero < 1:
+
+                    problemas.append(
+                        f"{ticker}: DATA_ATTEMPTS "
+                        "es menor que 1."
+                    )
+
+                else:
+
+                    resumen_fuente[
+                        "attempts_valid"
+                    ] += 1
+
+            elif campo == "DATA_OBSERVATIONS":
+
+                if numero < 0:
+
+                    problemas.append(
+                        f"{ticker}: DATA_OBSERVATIONS "
+                        "es negativo."
+                    )
+
+                else:
+
+                    resumen_fuente[
+                        "observations_valid"
+                    ] += 1
+
+    print(
+        "DATA_FIRST_DATE válidos: "
+        f"{resumen_fuente['first_date_valid']}/"
+        f"{len(registros_ok)}"
+    )
+
+    print(
+        "DATA_LAST_DATE válidos : "
+        f"{resumen_fuente['last_date_valid']}/"
+        f"{len(registros_ok)}"
+    )
+
+    print(
+        "DATA_ATTEMPTS válidos   : "
+        f"{resumen_fuente['attempts_valid']}/"
+        f"{len(registros_ok)}"
+    )
+
+    print(
+        "DATA_OBSERVATIONS válidos: "
+        f"{resumen_fuente['observations_valid']}/"
+        f"{len(registros_ok)}"
+    )
+
+    resumen["source_integrity"] = resumen_fuente
+
+
+# ============================================================
+# AUDITORÍA DE CAMPOS CERE FUTUROS
+# ============================================================
+
+def auditar_placeholders(
+    registros,
+    resumen,
+    problemas
+):
+
+    print_separator()
+    print("7. CAMPOS CERE PENDIENTES")
+    print_separator()
+
+    registros_ok = [
+        r
+        for r in registros
+        if str(
+            r.get("STATUS", "")
+        ).strip().upper() == "OK"
+    ]
+
+    resultados = {}
+
+    for campo in CERE_PLACEHOLDER_FIELDS:
+
+        con_valor = 0
+        vacios = 0
+
+        for registro in registros_ok:
+
+            valor = registro.get(campo)
+
+            if is_blank(valor):
+
+                vacios += 1
+
+            else:
+
+                con_valor += 1
+
+        resultados[campo] = {
+            "vacios": vacios,
+            "con_valor": con_valor,
+        }
+
+        print(
+            f"{campo:<15}: "
+            f"{vacios:3d}/{len(registros_ok)} vacíos"
         )
 
-    # ========================================================
-    # 10. REPORTE TXT
-    # ========================================================
+        # Por ahora estos campos DEBEN estar vacíos.
+        # Si alguno contiene información, lo reportamos
+        # porque significaría que la etapa siguiente
+        # ya fue ejecutada o que existe información inesperada.
+
+        if con_valor > 0:
+
+            problemas.append(
+                f"{campo}: existen {con_valor} "
+                "valores cuando todavía debería estar vacío."
+            )
+
+    resumen["cere_placeholders"] = resultados
+
+
+# ============================================================
+# AUDITORÍA DE RUN_ID
+# ============================================================
+
+def auditar_run_id(
+    registros,
+    resumen,
+    problemas
+):
+
+    print_separator()
+    print("8. CONSISTENCIA DEL RUN")
+    print_separator()
+
+    run_ids = sorted(
+        {
+            str(
+                r.get("RUN_ID", "")
+            ).strip()
+            for r in registros
+            if not is_blank(
+                r.get("RUN_ID")
+            )
+        }
+    )
+
+    print(
+        f"RUN_ID distintos: {len(run_ids)}"
+    )
+
+    for run_id in run_ids:
+
+        print(
+            f"   - {run_id}"
+        )
+
+    if len(run_ids) == 0:
+
+        problemas.append(
+            "No existe ningún RUN_ID válido."
+        )
+
+    elif len(run_ids) > 1:
+
+        problemas.append(
+            "CERE_CURRENT contiene más de un RUN_ID: "
+            + ", ".join(run_ids)
+        )
+
+    resumen["run_ids"] = run_ids
+
+
+# ============================================================
+# GENERAR CSV
+# ============================================================
+
+def generar_csv(
+    headers,
+    registros
+):
+
+    with open(
+        OUTPUT_CSV,
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as archivo:
+
+        writer = csv.DictWriter(
+            archivo,
+            fieldnames=headers,
+            extrasaction="ignore",
+        )
+
+        writer.writeheader()
+
+        for registro in registros:
+
+            writer.writerow(
+                {
+                    campo: registro.get(
+                        campo,
+                        ""
+                    )
+                    for campo in headers
+                }
+            )
+
+
+# ============================================================
+# GENERAR TXT
+# ============================================================
+
+def generar_txt(
+    resumen,
+    problemas
+):
 
     with open(
         OUTPUT_TXT,
         "w",
-        encoding="utf-8"
-    ) as f:
+        encoding="utf-8",
+    ) as archivo:
 
-        f.write(
+        archivo.write(
             "AUDITORÍA CERE — CERE_CURRENT\n"
         )
 
-        f.write(
-            "=" * 70 + "\n\n"
+        archivo.write(
+            "=" * 70
+            + "\n\n"
         )
 
-        f.write(
-            f"Filas: {len(df)}\n"
+        archivo.write(
+            "RESULTADO\n"
         )
 
-        f.write(
-            f"Columnas: {len(headers)}\n"
+        archivo.write(
+            "-" * 70
+            + "\n"
         )
 
-        f.write(
-            f"Tickers únicos: "
-            f"{tickers.nunique()}\n"
-        )
+        if problemas:
 
-        f.write(
-            f"Registros OK: "
-            f"{len(df_ok)}\n\n"
-        )
-
-        f.write(
-            "STATUS\n"
-        )
-
-        f.write(
-            "-" * 30 + "\n"
-        )
-
-        for status, count in status_counts.items():
-
-            f.write(
-                f"{status}: {count}\n"
+            archivo.write(
+                "AUDITORÍA CON OBSERVACIONES\n\n"
             )
 
-        f.write(
-            "\nVARIABLES DE ESTADO\n"
-        )
+            for problema in problemas:
 
-        f.write(
-            "-" * 30 + "\n"
-        )
+                archivo.write(
+                    "- "
+                    + problema
+                    + "\n"
+                )
 
-        for col, info in state_report.items():
+        else:
 
-            f.write(
-                f"{col}: "
-                f"{json.dumps(info, ensure_ascii=False)}\n"
+            archivo.write(
+                "AUDITORÍA COMPLETADA "
+                "SIN OBSERVACIONES\n"
             )
 
-    # ========================================================
-    # 11. RESULTADO FINAL
-    # ========================================================
-
-    print("\n" + "=" * 70)
-    print("RESULTADO DE LA AUDITORÍA")
-    print("=" * 70)
-
-    problems = []
-
-    if len(df) != 339:
-
-        problems.append(
-            "Se esperaban 339 filas "
-            f"y se recibieron {len(df)}."
+        archivo.write(
+            "\n\nRESUMEN\n"
         )
 
-    if len(headers) != 46:
-
-        problems.append(
-            "La estructura actual debería "
-            f"tener 46 columnas y se recibieron "
-            f"{len(headers)}."
+        archivo.write(
+            "-" * 70
+            + "\n"
         )
 
-    if missing_columns:
-
-        problems.append(
-            f"Faltan {len(missing_columns)} columnas."
-        )
-
-    if duplicates:
-
-        problems.append(
-            f"Hay {len(duplicates)} "
-            "tickers duplicados."
-        )
-
-    if problems:
-
-        print(
-            "\n⚠ AUDITORÍA CON OBSERVACIONES\n"
-        )
-
-        for problem in problems:
-
-            print(
-                f" - {problem}"
+        archivo.write(
+            json.dumps(
+                resumen,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
             )
-
-    else:
-
-        print(
-            "\n✓ ESTRUCTURA CORRECTA"
         )
 
-        print(
-            "✓ 339 registros recibidos"
-        )
+        archivo.write("\n")
 
-        print(
-            "✓ 46 columnas recibidas"
-        )
 
-        print(
-            "✓ Sin tickers duplicados"
-        )
+# ============================================================
+# GENERAR JSON
+# ============================================================
 
-        print(
-            "✓ Estructura CERE_CURRENT compatible"
-        )
+def generar_json(
+    resumen,
+    problemas
+):
 
-    print(
-        "\nArchivos generados:"
+    resultado = dict(resumen)
+
+    resultado["audit_status"] = (
+        "OK"
+        if not problemas
+        else "OBSERVATIONS"
     )
 
-    print(
-        f" - {OUTPUT_CSV}"
-    )
+    resultado["problems"] = problemas
 
-    print(
-        f" - {OUTPUT_JSON}"
-    )
+    with open(
+        OUTPUT_JSON,
+        "w",
+        encoding="utf-8",
+    ) as archivo:
 
-    print(
-        f" - {OUTPUT_TXT}"
-    )
-
-    return summary
+        json.dump(
+            resultado,
+            archivo,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
+def main():
+
+    print_separator()
+    print("AUDITORÍA CERE — LECTURA DE CERE_CURRENT")
+    print_separator()
+
+    problemas = []
+
+    resumen = {
+        "audit_timestamp_utc": (
+            datetime.utcnow().isoformat()
+            + "Z"
+        ),
+        "expected_column_count": (
+            EXPECTED_COLUMN_COUNT
+        ),
+        "expected_columns": (
+            EXPECTED_COLUMNS
+        ),
+    }
+
+    # --------------------------------------------------------
+    # 1. Obtener datos
+    # --------------------------------------------------------
+
+    data = obtener_datos()
+
+    headers = data["headers"]
+    rows = data["rows"]
+
+    resumen["sheet"] = data.get("sheet")
+    resumen["row_count_reported"] = (
+        data.get("row_count")
+    )
+    resumen["column_count_reported"] = (
+        data.get("column_count")
+    )
+
+    # --------------------------------------------------------
+    # 2. Convertir filas
+    # --------------------------------------------------------
+
+    registros = convertir_filas(
+        headers,
+        rows
+    )
+
+    resumen["row_count_local"] = len(
+        registros
+    )
+
+    # --------------------------------------------------------
+    # 3. Auditorías
+    # --------------------------------------------------------
+
+    auditar_estructura(
+        headers,
+        resumen,
+        problemas
+    )
+
+    auditar_tickers(
+        registros,
+        resumen,
+        problemas
+    )
+
+    auditar_status(
+        registros,
+        resumen,
+        problemas
+    )
+
+    auditar_variables_estado(
+        registros,
+        resumen,
+        problemas
+    )
+
+    auditar_precios(
+        registros,
+        resumen,
+        problemas
+    )
+
+    auditar_datos_fuente(
+        registros,
+        resumen,
+        problemas
+    )
+
+    auditar_placeholders(
+        registros,
+        resumen,
+        problemas
+    )
+
+    auditar_run_id(
+        registros,
+        resumen,
+        problemas
+    )
+
+    # --------------------------------------------------------
+    # 4. Resultado final
+    # --------------------------------------------------------
+
+    print_separator()
+    print("RESULTADO DE LA AUDITORÍA")
+    print_separator()
+
+    if problemas:
+
+        print(
+            "⚠ AUDITORÍA CON OBSERVACIONES"
+        )
+
+        for problema in problemas:
+
+            print(
+                f"- {problema}"
+            )
+
+    else:
+
+        print(
+            "✓ AUDITORÍA COMPLETADA "
+            "SIN OBSERVACIONES"
+        )
+
+    # --------------------------------------------------------
+    # 5. Generar archivos
+    # --------------------------------------------------------
+
+    generar_csv(
+        headers,
+        registros
+    )
+
+    generar_json(
+        resumen,
+        problemas
+    )
+
+    generar_txt(
+        resumen,
+        problemas
+    )
+
+    print()
+    print("Archivos generados:")
+    print(f"- {OUTPUT_CSV}")
+    print(f"- {OUTPUT_JSON}")
+    print(f"- {OUTPUT_TXT}")
+
+    print_separator()
+
+    # --------------------------------------------------------
+    # 6. Exit code
+    # --------------------------------------------------------
+
+    if problemas:
+
+        raise SystemExit(1)
+
+    raise SystemExit(0)
+
+
 if __name__ == "__main__":
-
-    try:
-
-        data = obtener_datos()
-
-        ejecutar_auditoria(data)
-
-    except Exception as e:
-
-        print("\n" + "=" * 70)
-        print("❌ ERROR EN AUDITORÍA")
-        print("=" * 70)
-
-        print(str(e))
-
-        raise
+    main()
